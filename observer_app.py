@@ -175,7 +175,6 @@ class ObserverApplication(QObject):
         self.worker.channel_changed.connect(self.ui.set_current_channel)
         self.worker.channel_geometry.connect(self._channel_geometry)
         self.worker.activity_changed.connect(self.ui.set_channel_active)
-        self.worker.channels_changed.connect(self.refresh_channels)
         self.worker.capture_saved.connect(self._capture_saved)
         self.worker.progress.connect(self._progress)
 

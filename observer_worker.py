@@ -15,13 +15,9 @@ Per channel visit:
 
     tune (channel placed away from the SDR's DC spike)
       -> wait for activity (in-band power vs the noise next to the channel)
-      -> measure the carrier centre ONCE, when the channel turns active
-      -> recenter the stored channel while preserving its existing bandwidth
-      -> isolate the channel (channel_isolator) and keep that estimate until
-         the transmission stops
+      -> isolate the channel (channel_isolator) using the scanner's stored
+         centre frequency and bandwidth
       -> one burst = one capture_N.wav via ChannelManager.append_capture()
-
-The next time the channel turns active it is measured again.
 
 Samples are the unit of collection: in auto mode a channel is finished once
 target_samples have been SAVED during this run (earlier sessions do not count).
@@ -58,20 +54,11 @@ SETTLE_SAMPLES = 16384             # thrown away after every retune
 SDR_OFFSET_MIN_HZ = 250e3          # channel sits at least this far from the SDR centre
 DC_GUARD_HZ = 10e3                 # keep the DC spike out of the channel (scanner dc_spike_cut)
 OUTER_CUT_HZ = 700e3               # unusable band edges (scanner outer_cut)
-MIN_HINT_BANDWIDTH_HZ = 5e3        # a hint narrower than this is widened
 
 # --- activity detection ------------------------------------------------
 ACTIVITY_FFT = 2048
 ACTIVITY_AVERAGES = 8
 HANG_TIME_S = 0.4                  # quiet this long = the burst has ended
-
-# --- carrier-centre measurement --------------------------------------
-MEASURE_FFT = 8192                 # 293 Hz bins at 2.4 MS/s
-MEASURE_AVERAGES = 16
-MEASURE_SPAN_FACTOR = 2.0          # analysed span = hint centre +/- this x hint bandwidth
-MEASURE_MIN_SPAN_HZ = 30e3
-MEASURE_MIN_SEARCH_HZ = 15e3       # the peak must lie this close to the hint
-MEASURE_MIN_PROMINENCE_DB = 6.0    # peak must rise this far above the floor
 
 # --- recording ---------------------------------------------------------
 OUTPUT_RATE_FACTOR = 1.5           # capture rate >= this x channel bandwidth
@@ -150,45 +137,6 @@ def band_snr_db(iq, sample_rate, offset_hz, bandwidth_hz):
     return None if levels is None else levels[0] - levels[1]
 
 
-def measure_carrier(iq, sample_rate, offset_hint, bandwidth_hint):
-    """
-    Find the strongest carrier near the channel hint.
-
-    Returns the carrier offset in Hz relative to the SDR centre, or None if
-    nothing clearly stands out.
-    """
-
-    rows = feat.power_rows(iq[: MEASURE_FFT * MEASURE_AVERAGES], MEASURE_FFT)
-
-    if rows.shape[0] < 2:
-        return None
-
-    spectrum_db = feat.to_db(rows.mean(axis=0)).astype(np.float64)
-    smooth = np.convolve(spectrum_db, np.ones(3) / 3.0, mode="same")
-    freqs = np.fft.fftshift(np.fft.fftfreq(MEASURE_FFT, 1.0 / sample_rate))
-
-    half_span = max(MEASURE_SPAN_FACTOR * bandwidth_hint, MEASURE_MIN_SPAN_HZ)
-    span = np.flatnonzero(np.abs(freqs - offset_hint) <= half_span)
-
-    if span.size < 16:
-        return None
-
-    search = span[
-        np.abs(freqs[span] - offset_hint) <= max(bandwidth_hint, MEASURE_MIN_SEARCH_HZ)
-    ]
-    if search.size == 0:
-        return None
-
-    peak_i = int(search[np.argmax(smooth[search])])
-    noise_db = float(np.percentile(smooth[span], 20))
-    peak_db = float(smooth[peak_i])
-
-    if peak_db - noise_db < MEASURE_MIN_PROMINENCE_DB:
-        return None
-
-    return float(freqs[peak_i])
-
-
 # ======================================================================
 # Reader thread
 # ======================================================================
@@ -243,7 +191,6 @@ class ObserverWorker(QObject):
                                                      # + gain_db, bandwidth, center, active
     channel_changed = pyqtSignal(int)                # channel now being observed
     channel_geometry = pyqtSignal(int, float, float) # id, start_hz, end_hz (marker on wideband plot)
-    channels_changed = pyqtSignal()                  # manager changed (refine / merge): reload list
     activity_changed = pyqtSignal(int, bool)         # id, transmitting
     capture_saved = pyqtSignal(int, str)             # id, wav path
     progress = pyqtSignal(object)                    # {channel_id: samples saved this run}
@@ -424,7 +371,7 @@ class ObserverWorker(QObject):
     @staticmethod
     def _geometry(channel):
         center = (channel.start_freq + channel.end_freq) / 2.0
-        bandwidth = max(channel.end_freq - channel.start_freq, MIN_HINT_BANDWIDTH_HZ)
+        bandwidth = channel.end_freq - channel.start_freq
         return center, bandwidth
 
     def _plan(self, center, bandwidth):
@@ -472,7 +419,7 @@ class ObserverWorker(QObject):
 
         v = SimpleNamespace(
             ch=channel, sdr_center=sdr_center, offset=offset, bw=bandwidth,
-            iso=None, window=None, measured=False,
+            iso=None, window=None, tracking=False,
             burst=[], burst_len=0, active_len=0, inactive_s=0.0, burst_start=None,
             t_feat=0.0, overflows=0, was_active=False, noise_db=None,
         )
@@ -530,11 +477,11 @@ class ObserverWorker(QObject):
 
         self._publish_wideband(chunk, v)
 
-        # --- transmission just started: measure once, refine, build the filter
-        if active and not v.measured:
-            active = self._begin_burst(chunk, v)
+        # --- transmission just started: isolate using the scanner's channel range
+        if active and not v.tracking:
+            active = self._begin_burst(v)
 
-        if not v.measured:
+        if not v.tracking:
             if hop:
                 return True                               # quiet channel: next one
             if v.iso is None:
@@ -544,7 +491,7 @@ class ObserverWorker(QObject):
         v.window.push(channel_iq)
         self._publish_features(v)
 
-        if not v.measured:
+        if not v.tracking:
             return False
 
         # --- a transmission is being followed ---------------------------
@@ -573,30 +520,17 @@ class ObserverWorker(QObject):
     # Burst start / end
     # ------------------------------------------------------------------
 
-    def _begin_burst(self, chunk, v):
-        offset = measure_carrier(chunk, self.sample_rate, v.offset, v.bw)
-
-        if offset is None:
-            return False
-
-        if abs(offset) > self.sample_rate / 2.0 - DC_GUARD_HZ:
-            return False
-
-        center = v.sdr_center + offset
-        v.ch = self._refine(v.ch, center, v.bw)
-        v.offset = center - v.sdr_center
-
+    def _begin_burst(self, v):
         try:
             self._build_isolator(v)
         except ValueError:
             return False
 
-        v.measured = True
+        v.tracking = True
         v.was_active = True
         v.burst_start = datetime.now(timezone.utc)
 
         self.activity_changed.emit(v.ch.id, True)
-        self.channel_geometry.emit(v.ch.id, v.ch.start_freq, v.ch.end_freq)
         return True
 
     def _end_burst(self, v):
@@ -605,9 +539,9 @@ class ObserverWorker(QObject):
 
         v.burst, v.burst_len, v.active_len, v.inactive_s = [], 0, 0, 0.0
 
-        if v.measured:
-            v.measured = False
-            v.iso = None                       # measured again next time it turns active
+        if v.tracking:
+            v.tracking = False
+            v.iso = None
             v.window = None
 
             center, bandwidth = self._geometry(v.ch)
@@ -667,29 +601,6 @@ class ObserverWorker(QObject):
         self.capture_saved.emit(v.ch.id, str(path))
         self.progress.emit(dict(self._collected))
 
-    def _refine(self, channel, center, bandwidth):
-        """Store the measured carrier centre without changing channel width."""
-
-        old_id = channel.id
-        survivor = self.manager.refine_channel_by_center(old_id, center, bandwidth)
-
-        if survivor.id != old_id:
-            new_id = survivor.id
-
-            if old_id in self._record_ids:
-                self._record_ids = (self._record_ids - {old_id}) | {new_id}
-            if old_id in self._demod_ids:
-                self._demod_ids = (self._demod_ids - {old_id}) | {new_id}
-            if self._manual_id == old_id:
-                self._manual_id = new_id
-            if old_id in self._collected:
-                self._collected[new_id] = (
-                    self._collected.get(new_id, 0) + self._collected.pop(old_id)
-                )
-
-        self.channels_changed.emit()
-        return survivor
-
     # ------------------------------------------------------------------
     # Isolator and display
     # ------------------------------------------------------------------
@@ -736,7 +647,7 @@ class ObserverWorker(QObject):
         data["gain_db"] = self._gain_db
         data["bandwidth"] = v.bw
         data["center"] = v.sdr_center + v.offset
-        data["active"] = v.measured
+        data["active"] = v.tracking
 
         if v.noise_db is not None:
             # Noise floor measured next to the channel, moved onto the channel
