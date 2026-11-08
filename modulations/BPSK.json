@@ -1,0 +1,6 @@
+{
+  "name": "BPSK",
+  "demodulator": null,
+  "digital": true,
+  "protocols": []
+}

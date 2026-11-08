@@ -1,0 +1,6 @@
+{
+  "name": "NFM",
+  "demodulator": "analog_voice",
+  "digital": false,
+  "protocols": []
+}

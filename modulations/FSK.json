@@ -1,0 +1,6 @@
+{
+  "name": "FSK",
+  "demodulator": null,
+  "digital": true,
+  "protocols": []
+}

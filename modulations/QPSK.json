@@ -1,0 +1,6 @@
+{
+  "name": "QPSK",
+  "demodulator": null,
+  "digital": true,
+  "protocols": []
+}

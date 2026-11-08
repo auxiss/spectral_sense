@@ -1,0 +1,6 @@
+{
+  "name": "WFM",
+  "demodulator": "analog_voice",
+  "digital": false,
+  "protocols": []
+}

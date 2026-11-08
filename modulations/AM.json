@@ -1,0 +1,6 @@
+{
+  "name": "AM",
+  "demodulator": "analog_voice",
+  "digital": false,
+  "protocols": []
+}
