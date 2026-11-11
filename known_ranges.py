@@ -1,4 +1,6 @@
+import csv
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass
@@ -21,31 +23,92 @@ class rf_range:
 
 
 
-class ranges_manager():
-    def __init__(self, file_name):
+class ranges_manager:
+    _CSV_FIELDS = (
+        "id",
+        "start_freq",
+        "end_freq",
+        "info",
+        "valid_golbe_region",
+        "hex_color",
+    )
 
+    def __init__(self, file_name="known_ranges.csv"):
+        self.file_name = Path(file_name)
         self.ranges = []
 
-        #load form file
 
-        self.ranges.append(rf_range(id=0, start_freq=87.5e6, end_freq=108e6, info="WB-FM brodcast", valid_golbe_region="itu:1", hex_color="#53CEFF"))
-        self.ranges.append(rf_range(id=1, start_freq=108e6, end_freq=137e6, info="aviation", valid_golbe_region="itu:1", hex_color="#538FFF"))
-        self.ranges.append(rf_range(id=2, start_freq=144e6, end_freq=146e6, info="2m_band.", valid_golbe_region="itu:1", hex_color="#FF5370"))
-        self.ranges.append(rf_range(id=3, start_freq=694e6, end_freq=862e6, info="mobile broadband", valid_golbe_region="itu:1", hex_color="#FCFF53"))
-        self.ranges.append(rf_range(id=4, start_freq=335e6, end_freq=470e6, info="defense/emergency/pub_safety, TETRA/PMR", valid_golbe_region="itu:1", hex_color="#59FF53"))
-        self.ranges.append(rf_range(id=5, start_freq=156e6, end_freq=170e6, info="maritimeVHF/distress/safety", valid_golbe_region="itu:1", hex_color="#3854A1"))
-        self.ranges.append(rf_range(id=6, start_freq=2.412e9, end_freq=2.484e9, info="WiFi", valid_golbe_region="itu:1", hex_color="#FCFF53"))
 
-        print(type(self.ranges))
+        if self.file_name.exists():
+            self.ranges = self._load()
+        else:
+            self._save(self.ranges)
 
+    def _load(self):
+        with self.file_name.open("r", newline="", encoding="utf-8") as ranges_file:
+            reader = csv.DictReader(ranges_file)
+            if reader.fieldnames != list(self._CSV_FIELDS):
+                raise ValueError(
+                    f"{self.file_name} must have CSV columns "
+                    f"{', '.join(self._CSV_FIELDS)}"
+                )
+
+            return [
+                rf_range(
+                    id=int(row["id"]),
+                    start_freq=float(row["start_freq"]),
+                    end_freq=float(row["end_freq"]),
+                    info=row["info"],
+                    valid_golbe_region=row["valid_golbe_region"],
+                    hex_color=row["hex_color"],
+                )
+                for row in reader
+            ]
+
+    def _save(self, ranges):
+        with self.file_name.open("w", newline="", encoding="utf-8") as ranges_file:
+            writer = csv.DictWriter(ranges_file, fieldnames=self._CSV_FIELDS)
+            writer.writeheader()
+            writer.writerows(
+                {
+                    "id": item.id,
+                    "start_freq": item.start_freq,
+                    "end_freq": item.end_freq,
+                    "info": item.info,
+                    "valid_golbe_region": item.valid_golbe_region,
+                    "hex_color": item.hex_color,
+                }
+                for item in ranges
+            )
 
     def get_ranges(self):
         return self.ranges
 
     def add(self, range: rf_range):
-        pass
+        if any(item.id == range.id for item in self.ranges):
+            raise ValueError(f"A frequency range with id {range.id} already exists")
+
+        updated_ranges = [*self.ranges, range]
+        self._save(updated_ranges)
+        self.ranges = updated_ranges
 
     def delete(self, id):
-        pass
+        updated_ranges = [item for item in self.ranges if item.id != id]
+        if len(updated_ranges) == len(self.ranges):
+            raise KeyError(f"No frequency range with id {id} exists")
+
+        self._save(updated_ranges)
+        self.ranges = updated_ranges
+
+    def replace(self, range: rf_range):
+        for index, item in enumerate(self.ranges):
+            if item.id == range.id:
+                updated_ranges = self.ranges.copy()
+                updated_ranges[index] = range
+                self._save(updated_ranges)
+                self.ranges = updated_ranges
+                return
+
+        raise KeyError(f"No frequency range with id {range.id} exists")
 
     
