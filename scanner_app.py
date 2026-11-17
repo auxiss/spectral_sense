@@ -13,7 +13,7 @@ class ScannerApplication(QObject):
         self.channels = channels
         self.last_beacons = []
 
-        ranges = known_ranges.ranges_manager("no_file").get_ranges()
+        ranges = known_ranges.ranges_manager().get_ranges()
         self.ui.set_frequency_ranges(ranges)
 
         self.sample_rate = 2.4e6
@@ -21,7 +21,7 @@ class ScannerApplication(QObject):
         self.max_freq = 150e6
         self.smothnes = 100
         self.gain = 20
-        self.threshold = 2
+        self.threshold = 6
         self.beacon_bandwidth = 100e3
         self.dynamic_thershold = True
         self.outer_cut = 700e3

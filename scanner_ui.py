@@ -6,6 +6,7 @@ import numpy as np
 import pyqtgraph as pg
 
 from known_ranges import ranges_manager as rf_range
+from range_selector import RangeSelector
 # from ranges_manager import rf_range
 
 from PyQt5.QtCore import Qt, pyqtSignal
@@ -112,6 +113,10 @@ class ScannerUI(QMainWindow):
     # main.py writes the beacon list to that path
     # (use os.path.dirname(path) if only the directory is needed).
     export_beacons_requested = pyqtSignal(str)
+
+    # Emitted when the current Start / Stop is saved as a known range:
+    # name, start (Hz), stop (Hz). main saves it and calls set_frequency_ranges().
+    save_range_requested = pyqtSignal(str, float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -371,6 +376,7 @@ class ScannerUI(QMainWindow):
         """
 
         self._frequency_ranges = list(ranges)
+        self.range_selector.set_ranges(self._frequency_ranges)
 
         # Remove previous range graphics
         for fill, text in self._frequency_range_items:
@@ -752,6 +758,10 @@ class ScannerUI(QMainWindow):
         self.frequency_group = QGroupBox("Frequency")
         frequency_layout = QFormLayout(self.frequency_group)
 
+        # Known ranges drop-down (+ Custom, + Save...)
+        self.range_selector = RangeSelector()
+        frequency_layout.addRow("Range:", self.range_selector)
+
         self.start_frequency_spin = self._make_frequency_spinbox()
         self.start_frequency_unit = self._make_unit_combo()
 
@@ -976,6 +986,10 @@ class ScannerUI(QMainWindow):
 
         # Controls
         self.start_button.clicked.connect(self.start_requested.emit)
+
+        # Range drop-down
+        self.range_selector.range_chosen.connect(self._on_range_chosen)
+        self.range_selector.save_requested.connect(self.save_range_requested.emit)
         self.stop_button.clicked.connect(self.stop_requested.emit)
         self.single_shot_button.clicked.connect(self.single_shot_requested.emit)
 
@@ -1075,7 +1089,47 @@ class ScannerUI(QMainWindow):
     # Signal emitters
     # ==================================================================
 
+    def _on_range_chosen(self, start_hz, stop_hz):
+        """A known range was picked in the drop-down: fill Start and Stop."""
+
+        controls = (
+            self.start_frequency_spin,
+            self.start_frequency_unit,
+            self.stop_frequency_spin,
+            self.stop_frequency_unit,
+        )
+
+        blocked = [control.blockSignals(True) for control in controls]
+
+        try:
+            self._set_frequency_control(
+                self.start_frequency_spin, self.start_frequency_unit, start_hz
+            )
+            self._set_frequency_control(
+                self.stop_frequency_spin, self.stop_frequency_unit, stop_hz
+            )
+        finally:
+            for control, was_blocked in zip(controls, blocked):
+                control.blockSignals(was_blocked)
+
+        # One clean update of the configuration (main gets Start and Stop).
+        self._emit_start_frequency()
+        self._emit_stop_frequency()
+
+    def _sync_range_selector(self):
+        """Start / Stop changed: show the matching known range, or Custom."""
+
+        multipliers = {"Hz": 1.0, "kHz": 1e3, "MHz": 1e6, "GHz": 1e9}
+
+        self.range_selector.update_for(
+            self.start_frequency_spin.value() * multipliers[self.start_frequency_unit.currentText()],
+            self.stop_frequency_spin.value() * multipliers[self.stop_frequency_unit.currentText()],
+        )
+
+
     def _emit_start_frequency(self):
+
+        self._sync_range_selector()
 
         self.start_frequency_changed.emit(
             self.start_frequency_spin.value(),
@@ -1083,6 +1137,8 @@ class ScannerUI(QMainWindow):
         )
 
     def _emit_stop_frequency(self):
+
+        self._sync_range_selector()
 
         self.stop_frequency_changed.emit(
             self.stop_frequency_spin.value(),

@@ -8,6 +8,9 @@ import csv
 from scanner_ui import ScannerUI
 from scanner import scanner
 import known_ranges
+from range_selector import save_custom_range
+# Known frequency ranges (created on first run). If you already have a file with
+KNOWN_RANGES_FILE = "known_ranges.csv"
 from channel_manager import ChannelManager
 
 
@@ -154,8 +157,8 @@ class ScannerApplication(QObject):
 
         self.last_beacons = []
 
-        ranges_manager = known_ranges.ranges_manager("no_file")
-        ranges = ranges_manager.get_ranges()
+        self.ranges_manager = known_ranges.ranges_manager(KNOWN_RANGES_FILE)
+        ranges = self.ranges_manager.get_ranges()
         self.ui.set_frequency_ranges(ranges)
         self.channels = ChannelManager("channels")
 
@@ -196,6 +199,7 @@ class ScannerApplication(QObject):
         self.ui.start_requested.connect(self.start)
         self.ui.stop_requested.connect(self.stop)
         self.ui.single_shot_requested.connect(self.single_shot)
+        self.ui.save_range_requested.connect(self._save_range)
 
         self.ui.export_beacons_requested.connect(
             self._export_beacons
@@ -454,6 +458,21 @@ class ScannerApplication(QObject):
                 print(f"Existing channels updated: {changes['updated']}")
         except Exception as exc:
             print(f"Could not update channels: {exc}")
+
+
+    @pyqtSlot(str, float, float)
+    def _save_range(self, info, start_hz, stop_hz):
+        """Save the current Start / Stop as a known range (file + drop-down + range strip)."""
+
+        try:
+            save_custom_range(self.ranges_manager, info, start_hz, stop_hz)
+        except Exception as exc:
+            print(f"Could not save range: {exc}")
+            return
+
+        self.ui.set_frequency_ranges(self.ranges_manager.get_ranges())
+
+
 
 
     @pyqtSlot(str)

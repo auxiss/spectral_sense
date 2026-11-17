@@ -37,7 +37,7 @@ class scanner:
         self.center_freq = min_freq
         self.sample_rate = sample_rate
         self.gain = gain
-        self.sampleSize = 1024*4
+        self.sampleSize = 1024*1
         self.SD = RTL_sdr_device.rtl_sdr_device()
         self.SD.set_sample_rate(self.sample_rate)
         self.SD.set_center_freq(self.center_freq)

@@ -26,11 +26,12 @@ from typing import Sequence
 import numpy as np
 import pyqtgraph as pg
 
-from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QBrush, QColor
+from PyQt5.QtCore import QItemSelectionModel, Qt, pyqtSignal
+from PyQt5.QtGui import QBrush, QColor, QKeySequence
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QAction,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -46,6 +47,7 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QShortcut,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -131,6 +133,7 @@ class ObserverUI(QMainWindow):
 
     channel_edit_saved = pyqtSignal(int, object)   # id, dict(name,start,end,modulation,protocol,info)
     channel_delete_requested = pyqtSignal(int)
+    channels_delete_requested = pyqtSignal(object)  # list of ids (several rows selected)
     modulation_text_changed = pyqtSignal(str)      # so the app can fill the protocol list
 
     capture_selected = pyqtSignal(int, str)        # channel id, capture file name
@@ -146,7 +149,8 @@ class ObserverUI(QMainWindow):
         self.setWindowTitle("SDR Observer")
         self.resize(1500, 850)
 
-        self._channels = []
+        self._channels = []               # every channel
+        self._shown = []                  # the ones passing the search filter (the table rows)
         self._decodable = set()
         self._demod_ids = set()
         self._record_ids = set()
@@ -243,7 +247,8 @@ class ObserverUI(QMainWindow):
         if self._edit_id not in ids:
             self._clear_edit()
 
-        self._rebuild_table()
+        self._update_filter_choices()
+        self._apply_filter()
 
         # Follow the worker's refinements, but never overwrite what is being typed.
         if self._edit_id is not None and not self._edit_touched:
@@ -266,7 +271,7 @@ class ObserverUI(QMainWindow):
         self._collected = dict(collected)
         self._target = int(target)
 
-        for row, channel in enumerate(self._channels):
+        for row, channel in enumerate(self._shown):
             item = self.channel_table.item(row, 0)
             if item is not None:
                 item.setText(self._row_text(channel))
@@ -275,7 +280,7 @@ class ObserverUI(QMainWindow):
         """Select a row programmatically (no signal)."""
         self._selected_id = channel_id
 
-        for row, channel in enumerate(self._channels):
+        for row, channel in enumerate(self._shown):
             if channel.id == channel_id:
                 blocked = self.channel_table.blockSignals(True)
                 self.channel_table.selectRow(row)
@@ -719,20 +724,83 @@ class ObserverUI(QMainWindow):
         self.channels_group = QGroupBox("Channels")
         layout = QVBoxLayout(self.channels_group)
 
+        # --- search bar (on top of the list) ----------------------------
+        search_row = QHBoxLayout()
+
+        self.filter_text = QLineEdit()
+        self.filter_text.setPlaceholderText("Search name, info, modulation, protocol")
+        self.filter_text.setClearButtonEnabled(True)
+
+        self.filter_modulation = QComboBox()
+        self.filter_modulation.addItem("Any")
+        self.filter_modulation.setToolTip("Modulation")
+
+        self.filter_protocol = QComboBox()
+        self.filter_protocol.addItem("Any")
+        self.filter_protocol.setToolTip("Protocol")
+
+        self.filter_more_button = QPushButton("More")
+        self.filter_more_button.setCheckable(True)
+        self.filter_clear_button = QPushButton("Clear")
+
+        search_row.addWidget(self.filter_text, stretch=3)
+        search_row.addWidget(QLabel("Mod:"))
+        search_row.addWidget(self.filter_modulation, stretch=1)
+        search_row.addWidget(QLabel("Proto:"))
+        search_row.addWidget(self.filter_protocol, stretch=1)
+        search_row.addWidget(self.filter_more_button)
+        search_row.addWidget(self.filter_clear_button)
+        layout.addLayout(search_row)
+
+        # --- frequency / bandwidth ranges (shown with "More") ----------
+        self.filter_more_widget = QWidget()
+        more = QGridLayout(self.filter_more_widget)
+        more.setContentsMargins(0, 0, 0, 0)
+
+        self.filter_center_from = self._make_filter_spinbox()
+        self.filter_center_to = self._make_filter_spinbox()
+        self.filter_center_unit = self._make_unit_combo()
+        self.filter_bw_min = self._make_filter_spinbox()
+        self.filter_bw_max = self._make_filter_spinbox()
+        self.filter_bw_unit = self._make_unit_combo()
+        self.filter_bw_unit.setCurrentText("kHz")
+
+        more.addWidget(QLabel("Center:"), 0, 0)
+        more.addWidget(self.filter_center_from, 0, 1)
+        more.addWidget(QLabel("to"), 0, 2)
+        more.addWidget(self.filter_center_to, 0, 3)
+        more.addWidget(self.filter_center_unit, 0, 4)
+        more.addWidget(QLabel("Bandwidth:"), 1, 0)
+        more.addWidget(self.filter_bw_min, 1, 1)
+        more.addWidget(QLabel("to"), 1, 2)
+        more.addWidget(self.filter_bw_max, 1, 3)
+        more.addWidget(self.filter_bw_unit, 1, 4)
+
+        self.filter_more_widget.setVisible(False)
+        layout.addWidget(self.filter_more_widget)
+
+        # --- header: select all, count, delete selected ----------------
         header = QHBoxLayout()
         self.select_all_demod_checkbox = QCheckBox("Select all demod")
         self.select_all_record_checkbox = QCheckBox("Select all record")
+        self.filter_count_label = QLabel("")
+        self.delete_selected_button = QPushButton("Delete selected")
+        self.delete_selected_button.setEnabled(False)
+
         header.addWidget(self.select_all_demod_checkbox)
         header.addWidget(self.select_all_record_checkbox)
         header.addStretch()
+        header.addWidget(self.filter_count_label)
+        header.addWidget(self.delete_selected_button)
         layout.addLayout(header)
 
+        # --- the list ----------------------------------------------------
         self.channel_table = QTableWidget(0, 3)
         self.channel_table.setHorizontalHeaderLabels(["Channel", "Demod", "Record"])
         self.channel_table.verticalHeader().setVisible(False)
         self.channel_table.verticalHeader().setDefaultSectionSize(ROW_HEIGHT)
         self.channel_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.channel_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.channel_table.setSelectionMode(QAbstractItemView.ExtendedSelection)   # Ctrl / Shift + click
         self.channel_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.channel_table.setShowGrid(False)
 
@@ -742,6 +810,25 @@ class ObserverUI(QMainWindow):
             header_view.setSectionResizeMode(column, QHeaderView.ResizeToContents)
 
         layout.addWidget(self.channel_table)
+
+        # --- wiring ------------------------------------------------------
+        self.filter_text.textChanged.connect(self._on_filter_changed)
+        self.filter_modulation.currentIndexChanged.connect(self._on_filter_changed)
+        self.filter_protocol.currentIndexChanged.connect(self._on_filter_changed)
+        for spin in (self.filter_center_from, self.filter_center_to, self.filter_bw_min, self.filter_bw_max):
+            spin.valueChanged.connect(self._on_filter_changed)
+        for combo in (self.filter_center_unit, self.filter_bw_unit):
+            combo.currentTextChanged.connect(self._on_filter_changed)
+
+        self.filter_more_button.toggled.connect(self.filter_more_widget.setVisible)
+        self.filter_clear_button.clicked.connect(self._clear_filter)
+
+        self.channel_table.itemSelectionChanged.connect(self._update_delete_button)
+        self.delete_selected_button.clicked.connect(self._on_delete_selected_clicked)
+
+        delete_key = QShortcut(QKeySequence(Qt.Key_Delete), self.channel_table)
+        delete_key.setContext(Qt.WidgetShortcut)
+        delete_key.activated.connect(self._on_delete_selected_clicked)
 
         return self.channels_group
 
@@ -953,10 +1040,20 @@ class ObserverUI(QMainWindow):
         return f"{title}\n{line}"
 
     def _rebuild_table(self):
-        blocked = self.channel_table.blockSignals(True)
-        self.channel_table.setRowCount(len(self._channels))
+        # Keep what is selected (several rows may be selected for deleting).
+        keep = set(self._selected_row_ids())
+        if not keep and self._selected_id is not None:
+            keep = {self._selected_id}
 
-        for row, channel in enumerate(self._channels):
+        blocked = self.channel_table.blockSignals(True)
+        self.channel_table.clearSelection()
+
+        # Remove every row first: Qt hides the removed rows' buttons at once
+        # (and deletes them later), so old and new buttons can never overlap.
+        self.channel_table.setRowCount(0)
+        self.channel_table.setRowCount(len(self._shown))
+
+        for row, channel in enumerate(self._shown):
             item = QTableWidgetItem(self._row_text(channel))
             item.setData(Qt.UserRole, channel.id)
             self.channel_table.setItem(row, 0, item)
@@ -973,13 +1070,17 @@ class ObserverUI(QMainWindow):
             self.channel_table.setCellWidget(row, 1, demod)
             self.channel_table.setCellWidget(row, 2, record)
 
-            if channel.id == self._selected_id:
-                self.channel_table.selectRow(row)
+            if channel.id in keep:
+                self.channel_table.selectionModel().select(
+                    self.channel_table.model().index(row, 0),
+                    QItemSelectionModel.Select | QItemSelectionModel.Rows,
+                )
 
         self.channel_table.blockSignals(blocked)
 
         self._apply_row_colors()
         self._sync_select_all()
+        self._update_delete_button()
 
     @staticmethod
     def _make_toggle_button(text):
@@ -988,7 +1089,7 @@ class ObserverUI(QMainWindow):
         return button
 
     def _apply_row_colors(self):
-        for row, channel in enumerate(self._channels):
+        for row, channel in enumerate(self._shown):
             item = self.channel_table.item(row, 0)
             if item is None:
                 continue
@@ -1007,6 +1108,11 @@ class ObserverUI(QMainWindow):
     def _on_row_clicked(self, row, _column):
         item = self.channel_table.item(row, 0)
         if item is None:
+            return
+
+        # Ctrl / Shift + click only builds a selection (for deleting): it must
+        # not switch the observed channel or reload the control panel.
+        if QApplication.keyboardModifiers() & (Qt.ControlModifier | Qt.ShiftModifier):
             return
 
         self._selected_id = int(item.data(Qt.UserRole))
@@ -1032,7 +1138,7 @@ class ObserverUI(QMainWindow):
         self.record_ids_changed.emit(set(self._record_ids))
 
     def _set_column_checked(self, column, ids):
-        for row, channel in enumerate(self._channels):
+        for row, channel in enumerate(self._shown):
             button = self.channel_table.cellWidget(row, column)
             if button is None or not button.isEnabled():
                 continue
@@ -1042,22 +1148,23 @@ class ObserverUI(QMainWindow):
             button.blockSignals(blocked)
 
     def _on_select_all_demod(self, checked):
-        self._demod_ids = (
-            {c.id for c in self._channels if c.id in self._decodable} if checked else set()
-        )
+        """Applies to the channels that are SHOWN (see the search); hidden ones keep their state."""
+        visible = {c.id for c in self._shown if c.id in self._decodable}
+        self._demod_ids = (self._demod_ids | visible) if checked else (self._demod_ids - visible)
         self._set_column_checked(1, self._demod_ids)
         self.demod_ids_changed.emit(set(self._demod_ids))
 
     def _on_select_all_record(self, checked):
-        self._record_ids = {c.id for c in self._channels} if checked else set()
+        visible = {c.id for c in self._shown}
+        self._record_ids = (self._record_ids | visible) if checked else (self._record_ids - visible)
         self._set_column_checked(2, self._record_ids)
         self.record_ids_changed.emit(set(self._record_ids))
 
     def _sync_select_all(self):
         """Keep the two header check boxes in step with the row buttons."""
 
-        eligible_demod = {c.id for c in self._channels if c.id in self._decodable}
-        all_ids = {c.id for c in self._channels}
+        eligible_demod = {c.id for c in self._shown if c.id in self._decodable}
+        all_ids = {c.id for c in self._shown}
 
         for checkbox, selected, universe in (
             (self.select_all_demod_checkbox, self._demod_ids, eligible_demod),
@@ -1066,6 +1173,154 @@ class ObserverUI(QMainWindow):
             blocked = checkbox.blockSignals(True)
             checkbox.setChecked(bool(universe) and selected >= universe)
             checkbox.blockSignals(blocked)
+
+    # ==================================================================
+    # Search (filter) and multi-select delete
+    # ==================================================================
+
+    @staticmethod
+    def _make_filter_spinbox():
+        spin = QDoubleSpinBox()
+        spin.setRange(0.0, 1_000_000_000_000.0)
+        spin.setDecimals(6)
+        spin.setSpecialValueText("any")          # 0 = not used
+        return spin
+
+    def _filter_hz(self, spin, unit_combo):
+        """Value of a filter spin box in Hz, or None when it says 'any'."""
+        if spin.value() <= 0:
+            return None
+        return self._to_hz(spin.value(), unit_combo.currentText())
+
+    def _filter_active(self):
+        return bool(
+            self.filter_text.text().strip()
+            or self.filter_modulation.currentIndex() > 0
+            or self.filter_protocol.currentIndex() > 0
+            or any(
+                spin.value() > 0
+                for spin in (self.filter_center_from, self.filter_center_to,
+                             self.filter_bw_min, self.filter_bw_max)
+            )
+        )
+
+    def _matches(self, channel) -> bool:
+        words = self.filter_text.text().lower().split()
+
+        if words:
+            haystack = " ".join(
+                (channel.name, channel.info, channel.modulation, channel.protocol)
+            ).lower()
+            if not all(word in haystack for word in words):
+                return False
+
+        if self.filter_modulation.currentIndex() > 0:
+            if channel.modulation != self.filter_modulation.currentText():
+                return False
+
+        if self.filter_protocol.currentIndex() > 0:
+            if channel.protocol != self.filter_protocol.currentText():
+                return False
+
+        center = (channel.start_freq + channel.end_freq) / 2.0
+        bandwidth = channel.end_freq - channel.start_freq
+
+        low = self._filter_hz(self.filter_center_from, self.filter_center_unit)
+        high = self._filter_hz(self.filter_center_to, self.filter_center_unit)
+        if (low is not None and center < low) or (high is not None and center > high):
+            return False
+
+        low = self._filter_hz(self.filter_bw_min, self.filter_bw_unit)
+        high = self._filter_hz(self.filter_bw_max, self.filter_bw_unit)
+        if (low is not None and bandwidth < low) or (high is not None and bandwidth > high):
+            return False
+
+        return True
+
+    def _update_filter_choices(self):
+        """Modulation / protocol drop-downs list the values that exist in the channel list."""
+
+        for combo, values in (
+            (self.filter_modulation, {c.modulation for c in self._channels}),
+            (self.filter_protocol, {c.protocol for c in self._channels}),
+        ):
+            current = combo.currentText() if combo.currentIndex() > 0 else None
+            ordered = sorted(values, key=str.lower)
+
+            blocked = combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("Any")
+            combo.addItems(ordered)
+            combo.setCurrentIndex(ordered.index(current) + 1 if current in ordered else 0)
+            combo.blockSignals(blocked)
+
+    def _apply_filter(self):
+        self._shown = [c for c in self._channels if self._matches(c)]
+
+        total = len(self._channels)
+        self.filter_count_label.setText(
+            f"{len(self._shown)} of {total}" if self._filter_active() else f"{total} channels"
+        )
+
+        self._rebuild_table()
+
+    def _on_filter_changed(self, *_):
+        self._apply_filter()
+
+    def _clear_filter(self):
+        widgets = (
+            self.filter_text, self.filter_modulation, self.filter_protocol,
+            self.filter_center_from, self.filter_center_to,
+            self.filter_bw_min, self.filter_bw_max,
+        )
+        blocked = [w.blockSignals(True) for w in widgets]
+
+        self.filter_text.clear()
+        self.filter_modulation.setCurrentIndex(0)
+        self.filter_protocol.setCurrentIndex(0)
+        for spin in (self.filter_center_from, self.filter_center_to, self.filter_bw_min, self.filter_bw_max):
+            spin.setValue(0.0)
+
+        for widget, was_blocked in zip(widgets, blocked):
+            widget.blockSignals(was_blocked)
+
+        self._apply_filter()
+
+    def _selected_row_ids(self):
+        """Ids of the rows selected in the table (Ctrl / Shift + click selects several)."""
+        rows = sorted({index.row() for index in self.channel_table.selectionModel().selectedRows()})
+        ids = []
+
+        for row in rows:
+            item = self.channel_table.item(row, 0)
+            if item is not None:
+                ids.append(int(item.data(Qt.UserRole)))
+
+        return ids
+
+    def _update_delete_button(self):
+        count = len(self._selected_row_ids())
+
+        self.delete_selected_button.setEnabled(count > 0)
+        self.delete_selected_button.setText(
+            f"Delete selected ({count})" if count else "Delete selected"
+        )
+
+    def _on_delete_selected_clicked(self):
+        ids = self._selected_row_ids()
+
+        if not ids:
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Delete channels",
+            f"Delete {len(ids)} channel{'s' if len(ids) != 1 else ''}?\n"
+            "Their recordings stay on disk.",
+        )
+
+        if answer == QMessageBox.Yes:
+            self.channels_delete_requested.emit(ids)
 
     # ==================================================================
     # Channel edit area

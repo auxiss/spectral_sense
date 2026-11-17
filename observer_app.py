@@ -67,6 +67,7 @@ class ObserverApplication(QObject):
 
         ui.channel_edit_saved.connect(self._channel_edit_saved)
         ui.channel_delete_requested.connect(self._channel_delete_requested)
+        ui.channels_delete_requested.connect(self._channels_delete_requested)
         ui.modulation_text_changed.connect(self._modulation_text_changed)
 
         ui.capture_selected.connect(self._capture_selected)
@@ -175,6 +176,7 @@ class ObserverApplication(QObject):
         self.worker.channel_changed.connect(self.ui.set_current_channel)
         self.worker.channel_geometry.connect(self._channel_geometry)
         self.worker.activity_changed.connect(self.ui.set_channel_active)
+        self.worker.channels_changed.connect(self.refresh_channels)
         self.worker.capture_saved.connect(self._capture_saved)
         self.worker.progress.connect(self._progress)
 
@@ -341,6 +343,15 @@ class ObserverApplication(QObject):
     def _channel_delete_requested(self, channel_id):
         # Recordings stay on disk (ChannelManager default).
         self.manager.delete_channel(channel_id)
+        self._disk = None
+        self.refresh_channels()
+
+    @pyqtSlot(object)
+    def _channels_delete_requested(self, channel_ids):
+        # Several rows selected in the list. Recordings stay on disk.
+        for channel_id in channel_ids:
+            self.manager.delete_channel(channel_id)
+
         self._disk = None
         self.refresh_channels()
 
