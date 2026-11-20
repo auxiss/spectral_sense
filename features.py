@@ -45,6 +45,7 @@ WIDEBAND_FFT_SIZE = 1024             # bins of the wideband spectrum
 
 IQ_DENSITY_BINS = 128                # the density image is BINS x BINS
 IQ_DENSITY_EXTENT = 3.0              # shown range is +/- this many RMS units
+IQ_DENSITY_SAMPLES = 16384           # latest samples used for the display
 
 # Waterfall colour levels follow the current window.
 # 0 / 100 = true minimum / maximum. Raise the low and lower the high
@@ -155,8 +156,16 @@ def waterfall_levels(waterfall_db) -> tuple[float, float]:
     if waterfall_db.size == 0:
         return -100.0, -100.0 + WATERFALL_MIN_SPAN_DB
 
-    low = float(np.percentile(waterfall_db, WATERFALL_LOW_PERCENTILE))
-    high = float(np.percentile(waterfall_db, WATERFALL_HIGH_PERCENTILE))
+    low = float(
+        waterfall_db.min()
+        if WATERFALL_LOW_PERCENTILE == 0.0
+        else np.percentile(waterfall_db, WATERFALL_LOW_PERCENTILE)
+    )
+    high = float(
+        waterfall_db.max()
+        if WATERFALL_HIGH_PERCENTILE == 100.0
+        else np.percentile(waterfall_db, WATERFALL_HIGH_PERCENTILE)
+    )
 
     if high - low < WATERFALL_MIN_SPAN_DB:
         high = low + WATERFALL_MIN_SPAN_DB
@@ -179,20 +188,27 @@ def iq_density(iq, bins: int = IQ_DENSITY_BINS) -> np.ndarray:
     if iq.size == 0:
         return np.zeros((bins, bins), dtype=np.float32)
 
-    rms = float(np.sqrt(np.mean(np.abs(iq) ** 2)))
+    power = iq.real ** 2 + iq.imag ** 2
+    rms = float(np.sqrt(np.mean(power)))
 
     if rms < EPS:
         return np.zeros((bins, bins), dtype=np.float32)
 
-    scaled = iq / rms
     extent = IQ_DENSITY_EXTENT
-
-    histogram, _, _ = np.histogram2d(
-        scaled.real,
-        scaled.imag,
-        bins=bins,
-        range=[[-extent, extent], [-extent, extent]],
+    scaled_i = iq.real / rms
+    scaled_q = iq.imag / rms
+    valid = (
+        (scaled_i >= -extent)
+        & (scaled_i <= extent)
+        & (scaled_q >= -extent)
+        & (scaled_q <= extent)
     )
+    scale = bins / (2.0 * extent)
+    ix = np.minimum(((scaled_i[valid] + extent) * scale).astype(np.intp), bins - 1)
+    iy = np.minimum(((scaled_q[valid] + extent) * scale).astype(np.intp), bins - 1)
+    histogram = np.bincount(
+        ix * bins + iy, minlength=bins * bins
+    ).reshape(bins, bins)
 
     histogram = np.log1p(histogram)
     peak = histogram.max()
@@ -310,7 +326,7 @@ class ChannelWindow:
             "waterfall_db": waterfall_db,
             "levels": waterfall_levels(waterfall_db),
             "snr_db": estimate_snr_db(spectrum_db),
-            "iq_density": iq_density(self._iq),
+            "iq_density": iq_density(self._iq[-IQ_DENSITY_SAMPLES:]),
             "sample_rate": self.sample_rate,
             "rows": len(self._rows),
         }

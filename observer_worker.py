@@ -50,7 +50,7 @@ from channel_isolator import ChannelConfig, ChannelIsolator
 
 # --- streaming ---------------------------------------------------------
 STREAM_CHUNK = 131072              # samples per read (multiple of 256), ~55 ms at 2.4 MS/s
-QUEUE_CHUNKS = 16                  # buffered chunks; overflow = gap in the stream
+QUEUE_CHUNKS = 64#16                  # buffered chunks; overflow = gap in the stream
 SETTLE_SAMPLES = 16384             # thrown away after every retune
 
 # --- centre / bandwidth ------------------------------------------------
@@ -507,6 +507,9 @@ class ObserverWorker(QObject):
             iso=None, window=None, measured=False,
             burst=[], burst_len=0, active_len=0, inactive_s=0.0, burst_start=None,
             t_feat=0.0, overflows=0, was_active=False, noise_db=None,
+            chunk_process_ms=0.0, queue_depth_before=0, queue_depth_after=0,
+            last_active=False, last_snr_db=None, chunk_started=None,
+            stage_ms={},
         )
 
         reader = self._start_reader()
@@ -517,7 +520,9 @@ class ObserverWorker(QObject):
                     break
 
                 if self._pending_gain is not None:
-                    self._end_burst(v)
+                    v.chunk_started = None
+                    v.chunk_process_ms = 0.0
+                    self._end_burst(v, "gain_change")
                     reader.stop()
                     self._apply_gain(self._pending_gain)
                     self._pending_gain = None
@@ -526,55 +531,133 @@ class ObserverWorker(QObject):
                     continue
 
                 try:
+                    queue_depth_before = reader.queue.qsize()
                     chunk = reader.queue.get(timeout=0.5)
                 except queue.Empty:
                     if reader.error is not None:
                         raise reader.error
                     continue
 
-                if reader.overflows != v.overflows:       # samples were lost: close the burst
-                    v.overflows = reader.overflows
-                    self._end_burst(v)
+                v.queue_depth_before = queue_depth_before
+                v.queue_depth_after = reader.queue.qsize()
 
+                if reader.overflows != v.overflows:       # samples were lost: close the burst
+                    dropped = reader.overflows - v.overflows
+                    v.overflows = reader.overflows
+                    v.chunk_started = None
+                    v.chunk_process_ms = 0.0
+                    v.stage_ms = {"queue_overflow_check": 0.0}
+                    self._end_burst(
+                        v,
+                        "queue_overflow",
+                        detail=f"dropped_chunks={dropped}",
+                    )
+
+                v.chunk_started = time.perf_counter()
+                v.stage_ms = {
+                    "activity": 0.0,
+                    "noise_update": 0.0,
+                    "wideband_publish": 0.0,
+                    "begin_burst": 0.0,
+                    "isolator_build": 0.0,
+                    "isolation": 0.0,
+                    "window_push": 0.0,
+                    "features": 0.0,
+                    "burst_append": 0.0,
+                    "demod": 0.0,
+                }
                 if self._process_chunk(chunk, v, hop):
                     break
+                v.chunk_process_ms = (time.perf_counter() - v.chunk_started) * 1000.0
+
+                print(
+                    "CHUNK DIAG: "
+                    f"process_ms={v.chunk_process_ms:.3f} "
+                    f"queue_before={v.queue_depth_before}/{QUEUE_CHUNKS} "
+                    f"queue_after={v.queue_depth_after}/{QUEUE_CHUNKS} "
+                    f"active={v.last_active} "
+                    f"snr_db="
+                    + ("none" if v.last_snr_db is None else f"{v.last_snr_db:.2f}")
+                    + f" measured={v.measured}"
+                    + " stages_ms={"
+                    + " ".join(
+                        f"{name}={elapsed:.3f}"
+                        for name, elapsed in v.stage_ms.items()
+                    )
+                    + "}",
+                    flush=True,
+                )
+                v.chunk_started = None
 
             if reader.error is not None:
                 raise reader.error
 
         finally:
             reader.stop()
-            self._end_burst(v)
+            if not hop and self._manual_id != v.ch.id:
+                end_reason = "manual_channel_switch"
+            elif self.stop_requested:
+                end_reason = "stop_requested"
+            elif reader.error is not None:
+                end_reason = "reader_error"
+            else:
+                end_reason = "visit_end"
+            self._end_burst(v, end_reason)
 
         return v.was_active
 
     def _process_chunk(self, chunk, v, hop):
         """Handle one wideband chunk. Returns True when the visit should end."""
 
+        started = time.perf_counter()
         levels = band_levels_db(chunk, self.sample_rate, v.offset, v.bw)
         snr = None if levels is None else levels[0] - levels[1]
         active = snr is not None and snr >= self.threshold_db
+        v.last_active = active
+        v.last_snr_db = snr
+        v.stage_ms["activity"] = (time.perf_counter() - started) * 1000.0
 
+        started = time.perf_counter()
         if levels is not None:                            # smoothed noise floor (for the threshold line)
             v.noise_db = (
                 levels[1] if v.noise_db is None else 0.9 * v.noise_db + 0.1 * levels[1]
             )
+        v.stage_ms["noise_update"] = (time.perf_counter() - started) * 1000.0
 
+        started = time.perf_counter()
         self._publish_wideband(chunk, v)
+        v.stage_ms["wideband_publish"] = (time.perf_counter() - started) * 1000.0
 
         # --- transmission just started: measure once, refine, build the filter
+        started = time.perf_counter()
         if active and not v.measured:
             active = self._begin_burst(chunk, v)
+        v.stage_ms["begin_burst"] = (time.perf_counter() - started) * 1000.0
 
+        started = time.perf_counter()
         if not v.measured:
             if hop:
+                v.stage_ms["isolation"] = 0.0
+                v.stage_ms["window_push"] = 0.0
+                v.stage_ms["features"] = 0.0
+                v.stage_ms["burst_append"] = 0.0
+                v.stage_ms["demod"] = 0.0
                 return True                               # quiet channel: next one
             if v.iso is None:
                 self._build_isolator(v)                   # preview so the plots still show the channel
+        v.stage_ms["isolator_build"] = (time.perf_counter() - started) * 1000.0
 
+        started = time.perf_counter()
         channel_iq = v.iso.process(chunk)
+        v.stage_ms["isolation"] = (time.perf_counter() - started) * 1000.0
+
+        started = time.perf_counter()
         v.window.push(channel_iq)
+        v.stage_ms["window_push"] = (time.perf_counter() - started) * 1000.0
+
+        started = time.perf_counter()
         self._publish_features(v)
+        v.stage_ms["features"] = (time.perf_counter() - started) * 1000.0
 
         if not v.measured:
             return False
@@ -585,18 +668,26 @@ class ObserverWorker(QObject):
 
         finished_target = False
 
+        started = time.perf_counter()
         if v.ch.id in self._record_ids and not self._is_done(v.ch.id):
             finished_target = self._add_to_burst(v, channel_iq, active)
+        v.stage_ms["burst_append"] = (time.perf_counter() - started) * 1000.0
 
+        started = time.perf_counter()
         if active and self.demod_sink is not None and v.ch.id in self._demod_ids:
             self.demod_sink.process(channel_iq, v.iso.output_sample_rate, v.ch)
+        v.stage_ms["demod"] = (time.perf_counter() - started) * 1000.0
 
         if finished_target:
-            self._end_burst(v)
+            self._end_burst(v, "target_reached")
             return True
 
         if v.inactive_s >= HANG_TIME_S:
-            self._end_burst(v)
+            self._end_burst(
+                v,
+                "hang_time",
+                detail=f"inactive_s={v.inactive_s:.3f}",
+            )
             return hop
 
         return False
@@ -639,10 +730,20 @@ class ObserverWorker(QObject):
         self.channel_geometry.emit(v.ch.id, v.ch.start_freq, v.ch.end_freq)
         return True
 
-    def _end_burst(self, v):
+    def _end_burst(self, v, reason, detail=""):
+        if v.chunk_started is not None:
+            v.chunk_process_ms = (time.perf_counter() - v.chunk_started) * 1000.0
+
+        measured_before = v.measured
+        burst_len_before = v.burst_len
+        inactive_s_before = v.inactive_s
+
+        started = time.perf_counter()
         if v.burst_len:
             self._save_burst(v)
+        v.stage_ms["burst_save"] = (time.perf_counter() - started) * 1000.0
 
+        started = time.perf_counter()
         v.burst, v.burst_len, v.active_len, v.inactive_s = [], 0, 0, 0.0
 
         if v.measured:
@@ -655,6 +756,27 @@ class ObserverWorker(QObject):
             v.bw = bandwidth
 
             self.activity_changed.emit(v.ch.id, False)
+        v.stage_ms["burst_state_reset"] = (time.perf_counter() - started) * 1000.0
+
+        snr_text = "none" if v.last_snr_db is None else f"{v.last_snr_db:.2f}"
+        detail_text = f" {detail}" if detail else ""
+        stages_text = " ".join(
+            f"{name}={elapsed:.3f}"
+            for name, elapsed in v.stage_ms.items()
+        )
+        print(
+            "BURST RESET: "
+            f"reason={reason} channel={v.ch.id} "
+            f"measured_before={measured_before} "
+            f"active_signal={v.last_active} snr_db={snr_text} "
+            f"activity_changed_false={measured_before} "
+            f"burst_len={burst_len_before} inactive_s={inactive_s_before:.3f} "
+            f"process_ms={v.chunk_process_ms:.3f} "
+            f"queue_depth={v.queue_depth_after}/{QUEUE_CHUNKS}"
+            f" stages_ms={{{stages_text}}}"
+            f"{detail_text}",
+            flush=True,
+        )
 
     def _add_to_burst(self, v, channel_iq, active):
         """Append to the burst. Returns True when this channel reached its target."""

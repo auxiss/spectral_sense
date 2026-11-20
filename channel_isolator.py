@@ -128,6 +128,8 @@ class FrequencyTranslator:
         self._fs = float(sample_rate)
         self._phase = 0.0       # radians, carried across chunks
         self._phase_inc = 0.0   # radians per sample
+        self._lo_key: tuple[int, float] | None = None
+        self._lo = np.empty(0, dtype=np.complex64)
         self.set_offset(offset_hz)
 
     def set_offset(self, offset_hz: float) -> None:
@@ -138,11 +140,15 @@ class FrequencyTranslator:
 
     def process(self, iq: np.ndarray) -> np.ndarray:
         n = len(iq)
-        # float64 phase math: float32 would drift audibly over long runs
-        phases = self._phase + self._phase_inc * np.arange(n, dtype=np.float64)
-        lo = np.exp(1j * phases).astype(np.complex64)
+        key = (n, self._phase_inc)
+        if key != self._lo_key:
+            phases = self._phase_inc * np.arange(n, dtype=np.float64)
+            self._lo = np.exp(1j * phases).astype(np.complex64)
+            self._lo_key = key
+
+        rot = np.complex64(np.exp(1j * self._phase))
         self._phase = (self._phase + self._phase_inc * n) % (2.0 * np.pi)
-        return iq * lo
+        return iq * self._lo * rot
 
     def reset(self) -> None:
         self._phase = 0.0
@@ -152,13 +158,13 @@ class FIRDecimator:
     """Low-pass FIR filter + downsample, with state carried across chunks."""
 
     def __init__(self, taps: np.ndarray, decimation: int):
-        self._taps = np.asarray(taps, dtype=np.float64)
+        self._taps = np.asarray(taps, dtype=np.float32)
         self._decim = int(decimation)
         self.reset()
 
     def reset(self) -> None:
-        # Filter delay line (the last len(taps)-1 inputs of the previous chunk)
-        self._zi = np.zeros(len(self._taps) - 1, dtype=np.complex128)
+        # Input history needed to continue the FIR across chunk boundaries.
+        self._hist = np.zeros(len(self._taps) - 1, dtype=np.complex64)
         # How many input samples to skip before the next one we keep, so the
         # decimation grid stays aligned across chunk boundaries.
         self._skip = 0
@@ -174,12 +180,35 @@ class FIRDecimator:
                              fs=sample_rate)
 
     def process(self, iq: np.ndarray) -> np.ndarray:
-        if iq.size == 0:
-            return iq[:0].astype(np.complex64)
-        filtered, self._zi = signal.lfilter(self._taps, 1.0, iq, zi=self._zi)
-        out = filtered[self._skip::self._decim]
-        self._skip = (self._skip - len(filtered)) % self._decim
-        return out.astype(np.complex64)
+        n = len(iq)
+        if n == 0:
+            return np.empty(0, dtype=np.complex64)
+
+        iq = np.asarray(iq, dtype=np.complex64)
+        taps_len = len(self._taps)
+        buf = np.concatenate((self._hist, iq))
+        count = len(range(self._skip, n, self._decim))
+
+        history_len = taps_len - 1
+        if history_len:
+            self._hist = buf[-history_len:].copy()
+
+        out = np.empty(0, dtype=np.complex64)
+        if count:
+            # Shift the input by padding so upfirdn's zero-phase downsampling
+            # grid includes the first output wanted for this chunk.
+            first = taps_len - 1 + self._skip
+            pad = (-first) % self._decim
+            if pad:
+                buf = np.pad(buf, (pad, 0))
+            filtered = signal.upfirdn(self._taps, buf, down=self._decim)
+            first_output = (first + pad) // self._decim
+            out = filtered[first_output:first_output + count].astype(
+                np.complex64, copy=False
+            )
+
+        self._skip = (self._skip - n) % self._decim
+        return out
 
 
 def _split_decimation(total: int, max_stage: int) -> List[int]:
